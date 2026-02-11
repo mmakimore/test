@@ -1,0 +1,344 @@
+"""
+Утилиты и валидация ParkingBot
+"""
+import re
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+PHONE_REGEX = r'^(\+7|7|8)?[\s\-]?\(?[489][0-9]{2}\)?[\s\-]?[0-9]{3}[\s\-]?[0-9]{2}[\s\-]?[0-9]{2}$'
+
+def validate_name(name: str):
+    # Требуем "Имя Фамилия" (минимум 2 слова)
+    name = re.sub(r"\s+", " ", (name or "").strip())
+    if len(name) < 3:
+        return False, "❌ Введите имя и фамилию (пример: Иван Иванов)"
+    if len(name) > 60:
+        return False, "❌ Слишком длинно (макс. 60 символов)"
+    parts = name.split(" ")
+    if len(parts) < 2:
+        return False, "❌ Нужно имя и фамилия (пример: Иван Иванов)"
+    for p in parts:
+        if not re.match(r"^[A-Za-zА-Яа-яЁё\-]+$", p):
+            return False, "❌ Используйте только буквы и дефис (пример: Иван Иванов)"
+    return True, name
+
+def validate_phone(phone):
+    cleaned = re.sub(r'[^\d+]', '', phone)
+    if not re.match(PHONE_REGEX, phone):
+        return False, "❌ Неверный формат. +7XXXXXXXXXX или 8XXXXXXXXXX"
+    if cleaned.startswith('+7'): cleaned = '8' + cleaned[2:]
+    elif cleaned.startswith('7') and len(cleaned) == 11: cleaned = '8' + cleaned[1:]
+    if len(cleaned) != 11: return False, "❌ Номер должен содержать 11 цифр"
+    return True, cleaned
+
+def luhn_check(card):
+    digits = [int(d) for d in card]
+    odd = digits[-1::-2]; even = digits[-2::-2]
+    total = sum(odd) + sum(d*2-9 if d*2>9 else d*2 for d in even)
+    return total % 10 == 0
+
+def validate_card(card):
+    cleaned = re.sub(r"\D", "", card or "")
+    if len(cleaned) != 16:
+        return False, "❌ Номер карты: 16 цифр"
+    from config import STRICT_CARD_VALIDATION, MIR_ONLY, ALLOWED_TEST_CARDS
+    if STRICT_CARD_VALIDATION and not luhn_check(cleaned):
+        return False, "❌ Неверный номер карты"
+    if MIR_ONLY:
+        prefix = int(cleaned[:4])
+        is_mir = 2200 <= prefix <= 2204
+        if (not is_mir) and (cleaned not in ALLOWED_TEST_CARDS):
+            return False, "❌ Только карты МИР (начинается на 2200–2204)"
+    return True, cleaned
+
+def validate_date(date_str):
+    if not re.match(r'^(0[1-9]|[12]\d|3[01])\.(0[1-9]|1[0-2])\.\d{4}$', date_str):
+        return False, None
+    try:
+        parsed = datetime.strptime(date_str, "%d.%m.%Y")
+        if parsed.date() < datetime.now().date(): return False, None
+        return True, parsed
+    except ValueError: return False, None
+
+def validate_time(time_str):
+    """Валидация времени.
+
+    На текущем проекте работаем только с почасовыми слотами, поэтому минуты должны быть 00.
+    """
+    m = re.match(r'^([01]\d|2[0-3]):([0-5]\d)$', (time_str or '').strip())
+    if not m:
+        return False, None
+    hh = int(m.group(1)); mm = int(m.group(2))
+    if mm != 0:
+        return False, None
+    return True, f"{hh:02d}:00"
+
+
+def validate_spot_number(s):
+    s = s.strip()
+    if len(s) < 1: return False, "❌ Номер не может быть пустым"
+    if len(s) > 10: return False, "❌ Максимум 10 символов"
+    return True, s
+
+def validate_license_plate(p):
+    """Принимаем любой госномер.
+
+    Ранее была строгая валидация РФ-формата (А123ВС77), из-за чего пользователи
+    не могли вводить номера в другом формате. Теперь допускаем любой ввод,
+    минимально очищая пробелы/дефисы и ограничивая длину.
+    """
+    p = (p or "").strip().upper()
+    # Убираем пробелы и дефисы — так удобнее читать и хранить
+    p = re.sub(r"[\s\-]", "", p)
+    if len(p) < 3:
+        return False, "❌ Номер слишком короткий"
+    if len(p) > 20:
+        return False, "❌ Номер слишком длинный"
+    # Разрешаем буквы/цифры (латиница/кириллица)
+    if not re.fullmatch(r"[0-9A-ZА-ЯЁ]+", p):
+        return False, "❌ Используйте только буквы и цифры"
+    return True, p
+def validate_car_brand(b):
+    b = b.strip()
+    if len(b) < 2: return False, "❌ Слишком короткое"
+    if len(b) > 50: return False, "❌ Слишком длинное"
+    return True, b
+
+def validate_car_color(c):
+    c = c.strip()
+    if len(c) < 2: return False, "❌ Слишком короткий"
+    if len(c) > 30: return False, "❌ Слишком длинный"
+    return True, c
+
+def format_datetime(dt):
+    if isinstance(dt, str): dt = datetime.fromisoformat(dt)
+    return dt.strftime("%d.%m.%Y %H:%M")
+
+def format_date(dt):
+    if isinstance(dt, str): dt = datetime.fromisoformat(dt)
+    return dt.strftime("%d.%m.%Y")
+
+def parse_datetime(date_str, time_str):
+    try: return datetime.strptime(f"{date_str} {time_str}", "%d.%m.%Y %H:%M")
+    except ValueError: return None
+
+def get_next_days(count=7):
+    # Даты показываем в локальной TZ (см. now_local), чтобы не было сдвигов на хостинге (UTC vs локальное).
+    today = now_local()
+    return [(today + timedelta(days=i)).strftime("%d.%m.%Y") for i in range(count)]
+
+def get_price_per_hour(hours):
+    """Возвращает усреднённую цену за час по тарифной сетке (для справки)."""
+    from config import PRICE_TOTAL_BY_HOURS, EXTRA_HOUR_PRICE_AFTER_24
+    h = int(max(1, hours))
+    if h in PRICE_TOTAL_BY_HOURS:
+        return int(round(PRICE_TOTAL_BY_HOURS[h] / h))
+    # >24ч: считаем как сутки + доп. часы
+    max_h = 24
+    base = int(PRICE_TOTAL_BY_HOURS[max_h])
+    total = base + (h - max_h) * int(EXTRA_HOUR_PRICE_AFTER_24)
+    return int(round(total / h))
+
+def _hours_ceil(start: datetime, end: datetime) -> int:
+    seconds = (end - start).total_seconds()
+    if seconds <= 0:
+        return 0
+    return int((seconds + 3600 - 1) // 3600)
+
+def calculate_price(start, end):
+    """
+    Расчёт цены по тарифам ДЕНЬ/НОЧЬ.
+
+    ДЕНЬ: 08:00–20:00, итоговая цена за N часов (1..12)
+    НОЧЬ: 20:00–08:00, итоговая цена за 10/11/12 часов:
+        10ч=600, 11ч=650, 12ч=700
+
+    Правила:
+    - если бронь целиком ночью — меньше 8 часов взять нельзя
+    - если бронь затрагивает день+ночь — ночная часть минимум 600₽ даже за 1 час
+    """
+    if isinstance(start, str):
+        start = datetime.fromisoformat(start)
+    if isinstance(end, str):
+        end = datetime.fromisoformat(end)
+
+    # округляем к часам вверх, но сохраняем исходные границы
+    if end <= start:
+        return 0
+
+    from config import (
+        DAY_TOTAL_BY_HOURS, NIGHT_TOTAL_BY_HOURS,
+        NIGHT_MIN_HOURS_ONLY, NIGHT_MIN_TOTAL_MIXED,
+        DAY_START, DAY_END,
+    )
+
+    def _parse_hhmm(s: str):
+        hh, mm = s.split(":")
+        return int(hh), int(mm)
+
+    day_start_h, day_start_m = _parse_hhmm(DAY_START)
+    day_end_h, day_end_m = _parse_hhmm(DAY_END)
+
+    def _is_day(dt: datetime) -> bool:
+        # День: [08:00, 20:00)
+        t = dt.time()
+        return (t.hour, t.minute) >= (day_start_h, day_start_m) and (t.hour, t.minute) < (day_end_h, day_end_m)
+
+    # шаг по часам (интерфейс бота всё равно выдаёт только часы)
+    # начало округляем вверх до следующего часа, если есть минуты/секунды
+    cur = start.replace(minute=0, second=0, microsecond=0)
+    if cur < start:
+        cur += timedelta(hours=1)
+
+    end_hr = end.replace(minute=0, second=0, microsecond=0)
+    # если end не ровно по часу — округляем вверх (это честно для тарифа)
+    if end_hr < end:
+        end_hr += timedelta(hours=1)
+
+    # Собираем сегменты (тип, часы)
+    segments = []
+    seg_type = None
+    seg_hours = 0
+    while cur < end_hr:
+        typ = "day" if _is_day(cur) else "night"
+        if seg_type is None:
+            seg_type = typ
+            seg_hours = 1
+        elif typ == seg_type:
+            seg_hours += 1
+        else:
+            segments.append((seg_type, seg_hours))
+            seg_type = typ
+            seg_hours = 1
+        cur += timedelta(hours=1)
+    if seg_type is not None and seg_hours:
+        segments.append((seg_type, seg_hours))
+
+    total_day_hours = sum(h for t, h in segments if t == "day")
+    total_night_hours = sum(h for t, h in segments if t == "night")
+
+    # Правило: бронь целиком ночью
+    if total_day_hours == 0 and total_night_hours > 0:
+        if total_night_hours < NIGHT_MIN_HOURS_ONLY:
+            raise ValueError("ночью меньше 8 часов взять нельзя")
+
+    def _day_cost(hours: int) -> int:
+        if hours <= 0:
+            return 0
+        if hours in DAY_TOTAL_BY_HOURS:
+            return int(DAY_TOTAL_BY_HOURS[hours])
+        # на всякий: если вдруг >12, продолжаем по ставке 65₽/ч (как 12 часов в таблице)
+        base = int(DAY_TOTAL_BY_HOURS[max(DAY_TOTAL_BY_HOURS.keys())])
+        extra_h = hours - max(DAY_TOTAL_BY_HOURS.keys())
+        return base + extra_h * 65
+
+    def _night_cost(hours: int, mixed: bool) -> int:
+        if hours <= 0:
+            return 0
+        # базовая цена по таблице (только 10/11/12)
+        base = int(NIGHT_TOTAL_BY_HOURS.get(hours, 0))
+        if base == 0:
+            # 8/9/1..9 часов в ночь — по правилам минимум 600 (в mixed), а в pure-night допустимо >=8 -> тоже 600
+            base = 0
+        if mixed:
+            return max(int(NIGHT_MIN_TOTAL_MIXED), base or int(NIGHT_MIN_TOTAL_MIXED))
+        # pure-night: если дошли сюда, hours >= 8
+        if hours < 10:
+            return int(NIGHT_MIN_TOTAL_MIXED)  # 600
+        return base
+
+    mixed = total_day_hours > 0 and total_night_hours > 0
+
+    total = 0
+    for typ, hours in segments:
+        if typ == "day":
+            total += _day_cost(hours)
+        else:
+            total += _night_cost(hours, mixed=mixed)
+
+    return int(total)
+
+
+def format_price_info():
+    """Строка с тарифами для показа пользователю"""
+    return (
+        "💰 <b>Тарифы:</b>\n"
+        "• 1-3ч → 150₽/ч\n"
+        "• 4-6ч → 120₽/ч\n"
+        "• 7-10ч → 90₽/ч\n"
+        "• 11-24ч → 60₽/ч\n"
+        "• 24ч+ → 60₽/ч"
+    )
+
+def mask_card(card):
+    if card and len(card) >= 4: return f"****{card[-4:]}"
+    return "—"
+
+def now_local():
+    """Текущее локальное время в TZ из config.TIMEZONE (naive datetime)."""
+    from config import TIMEZONE
+    tz = ZoneInfo(TIMEZONE)
+    return datetime.now(tz).replace(tzinfo=None, second=0, microsecond=0)
+
+def normalize_dt(dt: datetime) -> datetime:
+    """Нормализует datetime: обнуляет секунды/микросекунды."""
+    if isinstance(dt, str):
+        dt = datetime.fromisoformat(dt)
+    return dt.replace(second=0, microsecond=0)
+
+
+
+def now_tz(tz_name: str):
+    return datetime.now(ZoneInfo(tz_name))
+
+def round_to_step(dt: datetime, step_minutes: int):
+    """Округляет вниз к шагу step_minutes."""
+    dt = dt.replace(second=0, microsecond=0)
+    minutes = (dt.minute // step_minutes) * step_minutes
+    return dt.replace(minute=minutes)
+
+def parse_hhmm(s: str):
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", s.strip())
+    if not m:
+        raise ValueError("Invalid HH:MM")
+    h = int(m.group(1)); mi = int(m.group(2))
+    if h<0 or h>23 or mi<0 or mi>59:
+        raise ValueError("Invalid HH:MM")
+    return h, mi
+
+def is_within_working_hours(start_dt: datetime, end_dt: datetime, start_hhmm: str, end_hhmm: str):
+    sh, sm = parse_hhmm(start_hhmm)
+    eh, em = parse_hhmm(end_hhmm)
+
+    # Если окно покрывает весь день (00:00–23:59), ограничения по часам фактически нет.
+    if sh == 0 and sm == 0 and (eh * 60 + em) >= (23 * 60 + 59):
+        return True
+    day_start = start_dt.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    day_end = start_dt.replace(hour=eh, minute=em, second=0, microsecond=0)
+    # если end меньше start (ночной режим) — не поддерживаем
+    if day_end <= day_start:
+        return False
+    return start_dt >= day_start and end_dt <= day_end
+
+def validate_interval(start_dt: datetime, end_dt: datetime, now_dt: datetime, min_minutes: int,
+                      working_start: str, working_end: str):
+    # На всякий случай приводим всё к naive datetime.
+    # Это защищает от ошибки "can't compare offset-naive and offset-aware datetimes"
+    # если где-то передали aware.
+    if getattr(start_dt, "tzinfo", None):
+        start_dt = start_dt.replace(tzinfo=None)
+    if getattr(end_dt, "tzinfo", None):
+        end_dt = end_dt.replace(tzinfo=None)
+    if getattr(now_dt, "tzinfo", None):
+        now_dt = now_dt.replace(tzinfo=None)
+
+    if end_dt <= start_dt:
+        return False, "❌ Время окончания должно быть позже начала"
+    if start_dt < now_dt:
+        return False, "❌ Нельзя выбрать время в прошлом"
+    dur_min = int((end_dt - start_dt).total_seconds() // 60)
+    if dur_min < min_minutes:
+        return False, f"❌ Минимальная длительность {min_minutes} минут"
+    if not is_within_working_hours(start_dt, end_dt, working_start, working_end):
+        return False, f"❌ Доступно только в часы {working_start}–{working_end}"
+    return True, ""
