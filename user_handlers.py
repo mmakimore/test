@@ -18,7 +18,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 import database as db
-from config import WELCOME_TEXT, BANKS, MAX_ACTIVE_BOOKINGS, MAX_SPOTS_PER_USER, ABOUT_TEXT, RULES_TEXT, TIME_STEP_MINUTES, WORKING_HOURS_START, WORKING_HOURS_END, MIN_BOOKING_MINUTES, AVAILABILITY_LOOKAHEAD_DAYS, ADMIN_CHECK_USERNAME, CARD_NUMBER, TIMEZONE, FIXED_ADDRESS, PRICE_TOTAL_BY_HOURS
+from config import BANKS, MAX_ACTIVE_BOOKINGS, MAX_SPOTS_PER_USER, ABOUT_TEXT, RULES_TEXT, TIME_STEP_MINUTES, WORKING_HOURS_START, WORKING_HOURS_END, MIN_BOOKING_MINUTES, AVAILABILITY_LOOKAHEAD_DAYS, ADMIN_CHECK_USERNAME, CARD_NUMBER, TIMEZONE, FIXED_ADDRESS, PRICE_TOTAL_BY_HOURS, WELCOME_TEXT
 from keyboards import *
 from utils import *
 
@@ -133,23 +133,29 @@ async def _check_ban(msg_or_cb):
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer(WELCOME_TEXT)
+    # Синхронизируем username из Telegram всегда, чтобы он "притягивался" независимо от телефона.
+    tg_username = message.from_user.username or ""
     user = db.get_user_by_telegram_id(message.from_user.id)
     if user:
-        # Всегда подтягиваем username из Telegram (если он есть)
-        tg_username = message.from_user.username or ""
-        if tg_username and (not user.get("username") or user.get("username") != tg_username):
-            try:
-                db.update_user(user["id"], username=tg_username)
-                user["username"] = tg_username
-            except Exception:
-                pass
+        # Если пользователь поменял username или он был пустым — обновляем.
+        try:
+            if tg_username and tg_username != (user.get('username') or ""):
+                db.update_user(user['id'], username=tg_username)
+                user['username'] = tg_username
+        except Exception:
+            pass
         banned, reason, until = db.is_user_banned(user)
         if banned:
             t = "🚫 Вы заблокированы"
             if until: t += f" до {format_datetime(datetime.fromisoformat(until))}"
             if reason: t += f"\n📝 {reason}"
             await message.answer(t, parse_mode="HTML"); return
+        # Приветствие
+        try:
+            await message.answer(WELCOME_TEXT)
+        except Exception:
+            pass
+
         await message.answer(f"👋 <b>{user['full_name']}</b>, выберите действие:",
             reply_markup=get_main_menu_keyboard(user['role']=='admin'), parse_mode="HTML")
         unreviewed = db.get_completed_unreviewed_bookings(user['id'])
@@ -161,8 +167,11 @@ async def cmd_start(message: Message, state: FSMContext):
                     [InlineKeyboardButton(text="⭐ Оставить отзыв", callback_data=f"review_start_{b['id']}")]
                 ]))
     else:
+        # Запомним username сразу (на случай, если далее будут сообщения без from_user.username)
+        await state.update_data(tg_username=tg_username)
+        await message.answer(WELCOME_TEXT)
         await message.answer(
-            "👋 <b>ParkingBot</b> — аренда парковочных мест\n\n📝 Введите <b>имя и фамилию</b>:",
+            "📝 Введите <b>имя и фамилию</b>:",
             reply_markup=get_cancel_keyboard(), parse_mode="HTML")
         await state.set_state(RegistrationStates.waiting_name)
 
@@ -194,11 +203,17 @@ async def reg_phone(message: Message, state: FSMContext):
         ok, r = validate_phone(message.text)
         if not ok: await message.answer(r); return
     data = await state.get_data()
-    db.create_user(telegram_id=message.from_user.id, username=message.from_user.username or "",
-                   full_name=data['full_name'], phone=r)
+    tg_username = message.from_user.username or data.get('tg_username', "") or ""
+    db.create_user(
+        telegram_id=message.from_user.id,
+        username=tg_username,
+        full_name=data['full_name'],
+        phone=r
+    )
     await state.clear()
     await message.answer(f"✅ <b>Готово!</b>\n\n👤 {data['full_name']}\n📞 {r}",
         reply_markup=get_main_menu_keyboard(), parse_mode="HTML")
+    # Уведомления о новых пользователях отключены (по ТЗ).
 
 
 # ==================== NAV ====================
@@ -230,40 +245,37 @@ async def menu_cb(callback: CallbackQuery, state: FSMContext):
 # ==================== О СЕРВИСЕ / ПРАВИЛА ====================
 @router.message(F.text == "📊 Тарифы")
 async def show_tariffs(message: Message):
-    # ДЕНЬ (08:00–20:00) — по таблице (как на скрине)
-    day_rows = [
-        (1, 100, 100),
-        (2, 100, 200),
-        (3, 100, 300),
-        (4, 95, 380),
-        (5, 90, 450),
-        (6, 85, 510),
-        (7, 80, 560),
-        (8, 75, 600),
-        (9, 72, 648),
-        (10, 70, 700),
-        (11, 68, 748),
-        (12, 65, 780),
-    ]
+    # Таблица дневных тарифов (из config.PRICE_TOTAL_BY_HOURS)
+    from config import PRICE_TOTAL_BY_HOURS, NIGHT_TOTAL_BY_HOURS, NIGHT_START, NIGHT_END, NIGHT_MIN_HOURS, NIGHT_MIN_PRICE
 
+    rows = []
+    for h in sorted(PRICE_TOTAL_BY_HOURS.keys()):
+        total = int(PRICE_TOTAL_BY_HOURS[h])
+        per_h = int(round(total / h))
+        rows.append((h, total, per_h))
     lines = []
-    lines.append("ДЕНЬ (08:00–20:00)")
+    lines.append("📊 <b>Тарифы (день)</b>")
+    lines.append(f"📍 {FIXED_ADDRESS}")
+    lines.append("")
     lines.append("<pre>")
-    lines.append("| Часы | ₽ / час | ₽ итого |")
-    lines.append("| ---- | ------- | ------ |")
-    for h, per_h, total in day_rows:
-        lines.append(f"| {h:<4} | {per_h:<7} | {total:<6} |")
+    lines.append("| Часы | Итоговая цена | Цена за час |")
+    lines.append("| ---- | ------------- | ----------- |")
+    for h,total,per_h in rows:
+        lines.append(f"| {str(h).ljust(4)} | {str(total).ljust(13)} | {str(per_h).ljust(11)} |")
     lines.append("</pre>")
+
+    # Ночные тарифы
     lines.append("")
-    lines.append("НОЧЬ (20:00–08:00)")
-    lines.append("• 10 часов — 600₽")
-    lines.append("• 11 часов — 650₽")
-    lines.append("• 12 часов — 700₽")
-    lines.append("")
-    lines.append("Если время затрагивает два тарифа — считается «день + ночь».")
-    lines.append("Ночью меньше 8 часов взять нельзя (если бронь целиком ночью).")
-    lines.append("Если взяли дневной тариф и зашли на ночь — ночная часть минимум 600₽ даже за 1 час.")
-    lines.append("")
+    lines.append(f"🌙 <b>Ночь</b>: {NIGHT_START}–{NIGHT_END}")
+    lines.append(f"Минимум ночью: <b>{NIGHT_MIN_HOURS} часов</b> (если бронь только ночью)")
+    lines.append(f"Если бронь заходит в ночь из дня — ночная часть считается отдельно, минимум <b>{NIGHT_MIN_PRICE}₽</b> даже за 1 час.")
+    lines.append("<pre>")
+    lines.append("| Часы | Итоговая цена |")
+    lines.append("| ---- | ------------- |")
+    for h in sorted(NIGHT_TOTAL_BY_HOURS.keys()):
+        lines.append(f"| {str(h).ljust(4)} | {str(int(NIGHT_TOTAL_BY_HOURS[h])).ljust(13)} |")
+    lines.append("</pre>")
+
     lines.append("По всем вопросам пишите @timofey_zhuravel")
     await message.answer("\n".join(lines), parse_mode="HTML")
 
@@ -436,8 +448,8 @@ def _confirm_text(bs, be):
     h = (be - bs).total_seconds() / 3600
     try:
         tp = calculate_price(bs, be)
-    except ValueError as e:
-        return f"❌ {e}"
+    except ValueError:
+        tp = "—"
     rate = get_price_per_hour(h)
     return (
         f"📋 <b>Подтверждение</b>\n\n"
@@ -445,6 +457,7 @@ def _confirm_text(bs, be):
         f"💰 <b>Итого: {tp}₽</b>\n\n"
         f"🅿️ Номер места будет виден после подтверждения оплаты администратором."
     )
+
 
 @router.callback_query(SearchStates.selecting_slot, F.data.startswith("slot_"))
 async def select_slot(callback: CallbackQuery, state: FSMContext):
@@ -472,7 +485,8 @@ async def select_slot(callback: CallbackQuery, state: FSMContext):
     try:
         full_price = calculate_price(sdt, edt)
     except ValueError:
-        full_price = 0
+        await callback.message.answer("❌ Этот слот нельзя забронировать по тарифам (ночью минимум 8 часов).")
+        return
     rate = get_price_per_hour(hours)
     addr = slot.get('address') or "—"
     await state.update_data(
@@ -493,15 +507,15 @@ async def select_slot(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text(header + "📅 <b>Дата начала</b>:",
             reply_markup=_date_range_kb(sdt, edt, "bksd"), parse_mode="HTML")
         await state.set_state(SearchStates.selecting_start_date)
-    elif hours > 2:
+    elif hours > 1:
         await callback.message.edit_text(header + "⏰ <b>Время начала</b>:",
             reply_markup=_time_range_kb(sdt, edt, "bkst"), parse_mode="HTML")
         await state.set_state(SearchStates.selecting_start_time)
     else:
         try:
             tp = calculate_price(sdt, edt)
-        except ValueError as e:
-            await callback.answer(f"❌ {e}", show_alert=True)
+        except ValueError:
+            await callback.message.answer("❌ Ночью можно бронировать минимум 8 часов (если бронь только ночью).")
             return
         await state.update_data(start_time=sdt, end_time=edt, total_price=tp)
         await callback.message.edit_text(_confirm_text(sdt, edt),
@@ -518,8 +532,8 @@ async def bk_start_date(callback: CallbackQuery, state: FSMContext):
     if val == "full":
         try:
             tp = calculate_price(sdt, edt)
-        except ValueError as e:
-            await callback.answer(f"❌ {e}", show_alert=True)
+        except ValueError:
+            await callback.message.answer("❌ Ночью можно бронировать минимум 8 часов (если бронь только ночью).")
             return
         await state.update_data(start_time=sdt, end_time=edt, total_price=tp)
         await callback.message.edit_text(_confirm_text(sdt, edt),
@@ -544,8 +558,8 @@ async def bk_start_time(callback: CallbackQuery, state: FSMContext):
     if val == "full":
         try:
             tp = calculate_price(sdt, edt)
-        except ValueError as e:
-            await callback.answer(f"❌ {e}", show_alert=True)
+        except ValueError:
+            await callback.message.answer("❌ Ночью можно бронировать минимум 8 часов (если бронь только ночью).")
             return
         await state.update_data(start_time=sdt, end_time=edt, total_price=tp)
         await callback.message.edit_text(_confirm_text(sdt, edt),
@@ -578,8 +592,8 @@ async def bk_end_date(callback: CallbackQuery, state: FSMContext):
     if val == "full":
         try:
             tp = calculate_price(bs, edt)
-        except ValueError as e:
-            await callback.answer(f"❌ {e}", show_alert=True)
+        except ValueError:
+            await callback.message.answer("❌ Ночью можно бронировать минимум 8 часов (если бронь только ночью).")
             return
         await state.update_data(start_time=bs, end_time=edt, total_price=tp)
         await callback.message.edit_text(_confirm_text(bs, edt),
@@ -611,8 +625,8 @@ async def bk_end_time(callback: CallbackQuery, state: FSMContext):
         except: return
     try:
         tp = calculate_price(bs, be)
-    except ValueError as e:
-        await callback.answer(f"❌ {e}", show_alert=True)
+    except ValueError:
+        await callback.message.answer("❌ Ночью можно бронировать минимум 8 часов (если бронь только ночью).")
         return
     await state.update_data(start_time=bs, end_time=be, total_price=tp)
     await callback.message.edit_text(_confirm_text(bs, be),
@@ -640,6 +654,8 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext):
         msg = str(e).lower()
         if "past" in msg or "прошл" in msg:
             text = "❌ Нельзя бронировать время в прошлом."
+        elif "night booking" in msg or "at least 8" in msg:
+            text = "❌ Ночью можно бронировать минимум 8 часов (если бронь только ночью)."
         elif "outside" in msg or "вне" in msg:
             text = "❌ Вы выбрали время вне доступного слота."
         elif "booked" in msg or "занят" in msg:
