@@ -153,7 +153,7 @@ def calculate_price(start, end):
     - Ночью (20:00–08:00) действует отдельный тариф:
         • 10ч → 600₽, 11ч → 650₽, 12ч → 700₽
         • минимальная стоимость ночного тарифа — 600₽
-        • если бронь полностью в ночном окне — минимум 8 часов
+        • ночной тариф можно брать от 1 часа, но ночная часть всегда минимум 600₽
     - Если бронь затрагивает и день, и ночь — стоимость = (день) + (ночь).
 
     Минуты округляются вверх до часа (как и раньше).
@@ -168,7 +168,7 @@ def calculate_price(start, end):
 
     from config import (
         PRICE_TOTAL_BY_HOURS, EXTRA_HOUR_PRICE_AFTER_24,
-        NIGHT_START, NIGHT_END, NIGHT_MIN_HOURS, NIGHT_MIN_PRICE, NIGHT_TOTAL_BY_HOURS,
+        NIGHT_START, NIGHT_END, NIGHT_MIN_PRICE, NIGHT_TOTAL_BY_HOURS,
     )
 
     def _day_price(h: int) -> int:
@@ -247,10 +247,6 @@ def calculate_price(start, end):
 
     total_night_hours = sum(night_segments_hours)
     mixed = day_hours > 0 and total_night_hours > 0
-
-    # Ночная бронь целиком: минимум 8 часов
-    if day_hours == 0 and total_night_hours > 0 and total_night_hours < int(NIGHT_MIN_HOURS):
-        raise ValueError("Night booking must be at least 8 hours")
 
     total = _day_price(day_hours)
     # Ночь считаем по каждому сегменту (если бронь затрагивает два разных ночных окна в длинных бронях).
